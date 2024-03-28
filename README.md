@@ -7,4 +7,4 @@ The `node` stacks create a GraphQL API with a HTTP Proxy fronted by a Latency Ro
 
 The base `api` stack also includes a KMS key that's replicated in each `node` stack. The intention of this was to be used by the Lambda Authorizer for the region specific GraphQL API to authorize encrypted credentials stored in the global table as a 'global' authentication mechanism. This was preferable compared to AWS managed regional API keys (would fail if requests were routed to the region that the key wasn't created in) or cognito authorization which are inherently non-global
 
-![Diagram](images/diagram.png)
+![](/images/diagram.png)
