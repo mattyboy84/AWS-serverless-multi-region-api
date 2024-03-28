@@ -1,0 +1,19 @@
+{
+  "name": "AWS-Serverless-Multi-Region-API",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "deploy:api": "serverless deploy --config api.yml",
+    "deploy:node": "serverless deploy --config node.yml",
+    "remove:api": "serverless remove --config api.yml",
+    "remove:node": "serverless remove --config node.yml"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "serverless": "^3.38.0",
+    "serverless-apigateway-deployment-timestamp": "^1.0.2",
+    "serverless-iam-roles-per-function": "^3.2.0",
+    "serverless-plugin-for-each": "^3.0.1"
+  }
+}

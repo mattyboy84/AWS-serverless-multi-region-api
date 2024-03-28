@@ -1,0 +1,510 @@
+service: sls-multi-region-api-node
+
+frameworkVersion: '3'
+
+plugins:
+  - serverless-apigateway-deployment-timestamp
+  - serverless-iam-roles-per-function
+
+custom:
+  parentRegion: ${param:parentRegion}
+  parentService: sls-multi-region-api
+  globalTableName: ${ssm(${self:custom.parentRegion}):/${self:custom.parentService}/globalTableName}
+  globalTableArn: ${ssm(${self:custom.parentRegion}):/${self:custom.parentService}/globalTableArn}
+  hostedZoneId: ${ssm(${self:custom.parentRegion}):/${self:custom.parentService}/hostedZoneId}
+  domainName: ${ssm(${self:custom.parentRegion}):/${self:custom.parentService}/domainName}
+  KMSkeyArn: ${ssm(${self:custom.parentRegion}):/${self:custom.parentService}/KMSkeyArn}
+  KMSkeyAlias: ${ssm(${self:custom.parentRegion}):/${self:custom.parentService}/KMSkeyAlias}
+  stageName: v1
+  #deploymentBucket: "cdk-hnb659fds-assets-${aws:accountId}-${opt:region}"
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  memorySize: 3008
+  timeout: 900
+  versionFunctions: false
+  tracing:
+    lambda: true
+  deploymentBucket:
+    blockPublicAccess: true
+
+functions:
+  PingMethod:
+    handler: src/index.handler
+    environment:
+      fail: false
+  AppsyncAuthorizer:
+    handler: src/authorizer.handler
+  
+resources:
+  Parameters:
+    domainName:
+      Type: String
+      Default: ${self:custom.domainName}
+    hostedZoneId:
+      Type: String
+      Default: ${self:custom.hostedZoneId}
+    stageName:
+      Type: String
+      Default: ${self:custom.stageName}
+    KMSkeyArn:
+      Type: String
+      Default: ${self:custom.KMSkeyArn}
+    KMSkeyAlias:
+      Type: String
+      Default: ${self:custom.KMSkeyAlias}
+  
+  Conditions:
+    #createKmsReplica: false
+    createKmsReplica: !Not [!Equals [!Ref AWS::Region, "${self:custom.parentRegion}"]]
+  
+  Resources:
+    APIloggingRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: !Sub "${self:custom.parentService}-${AWS::Region}-APIloggingRole"
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - appsync.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: "/"
+        ManagedPolicyArns:
+          - "arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs"
+    
+    lambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: !Sub "${self:custom.parentService}-${AWS::Region}-lambdaRole"
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: "/"
+        ManagedPolicyArns:
+          - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+    
+    dynamoStoreRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: !Sub "${self:custom.parentService}-${AWS::Region}-dynamoStoreRole"
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - appsync.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: "/"
+        Policies:
+          - PolicyName: !Sub "${self:custom.parentService}-${AWS::Region}-dynamoStoreRole-policy"
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - "dynamodb:GetItem"
+                    - "dynamodb:PutItem"
+                  Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${self:custom.globalTableName}"
+    
+    PingMethodIntegrationRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: !Sub "${self:custom.parentService}-${AWS::Region}-PingMethodIntegrationRole"
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - apigateway.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: "/"
+        #Policies:
+        #  - PolicyName: !Sub "${self:custom.parentService}-${AWS::Region}-ApiIntegrationRole-policy"
+        #    PolicyDocument:
+        #      Version: '2012-10-17'
+        #      Statement:
+        #        - Effect: Allow
+        #          Action:
+        #            - "cognito-idp:InitiateAuth"
+        #            - "cognito-idp:AdminSetUserPassword"
+        #            - "cognito-idp:AdminCreateUser"
+        #          Resource: !Ref globalCognitoUserPoolArn
+        ManagedPolicyArns:
+          - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+    
+    RegionalApi:
+      Type: AWS::AppSync::GraphQLApi
+      Properties:
+        Name: !Sub "${self:custom.parentService}-${AWS::Region}-Api"
+        ApiType: GRAPHQL
+        AuthenticationType: API_KEY
+        AdditionalAuthenticationProviders:
+          - AuthenticationType: AWS_LAMBDA
+            LambdaAuthorizerConfig:
+              AuthorizerResultTtlInSeconds: 360
+              AuthorizerUri: !GetAtt AppsyncAuthorizerLambdaFunction.Arn
+        LogConfig:
+          CloudWatchLogsRoleArn: !GetAtt APIloggingRole.Arn
+          ExcludeVerboseContent: false
+          FieldLogLevel: ALL # Can be NONE, ERROR or ALL
+        Visibility: GLOBAL # Can be GLOBAL or PRIVATE
+        XrayEnabled: true
+    
+    RegionalApiLogs:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: !Join ['', ['/aws/appsync/apis/', !GetAtt RegionalApi.ApiId]]
+    
+    RegionalApiKey:
+      Type: AWS::AppSync::ApiKey
+      Properties: 
+        ApiId: !GetAtt RegionalApi.ApiId
+    
+    # https://docs.amplify.aws/javascript/tools/cli/graphqlapi/directives-reference/
+    RegionalApiSchema:
+      Type: AWS::AppSync::GraphQLSchema
+      Properties: 
+        ApiId: !GetAtt RegionalApi.ApiId
+        Definition:
+          !Sub |
+            schema {
+              query: Query
+              mutation: Mutation
+            }
+            
+            type Query {
+              getPost(id: ID!): Post
+                @aws_api_key
+                @aws_lambda
+            }
+            
+            type Mutation {
+              addPost(
+                author: String!
+                title: String!
+                content: String!
+                url: String!
+              ): Post!
+                @aws_api_key
+                @aws_lambda
+            }
+            
+            type Post {
+              id: ID! @aws_api_key @aws_lambda
+              author: String @aws_api_key @aws_lambda
+              title: String @aws_api_key @aws_lambda
+              content: String @aws_api_key @aws_lambda
+              url: String @aws_api_key @aws_lambda
+              ups: Int! @aws_api_key @aws_lambda
+              downs: Int! @aws_api_key @aws_lambda
+              version: Int! @aws_api_key @aws_lambda
+            }
+    
+    DynamoDataSource:
+      Type: AWS::AppSync::DataSource
+      Properties:
+        Name: DynamoDataSource # ^[_A-Za-z][_0-9A-Za-z]*$
+        ApiId: !GetAtt RegionalApi.ApiId
+        Type: AMAZON_DYNAMODB
+        ServiceRoleArn: !GetAtt dynamoStoreRole.Arn
+        DynamoDBConfig:
+          TableName: ${self:custom.globalTableName} # This creates a data source against the replica in this region
+          AwsRegion: !Ref AWS::Region
+    
+    addPostResolver:
+      Type: AWS::AppSync::Resolver
+      Properties:
+        ApiId: !GetAtt RegionalApi.ApiId
+        DataSourceName: !GetAtt DynamoDataSource.Name
+        TypeName: Mutation
+        FieldName: addPost
+        RequestMappingTemplate: |
+          {
+            "version" : "2017-02-28",
+            "operation" : "PutItem",
+            "key" : {
+              "id" : $util.dynamodb.toDynamoDBJson($util.autoId())
+            },
+            "attributeValues" : {
+              "author" : $util.dynamodb.toDynamoDBJson($context.arguments.author),
+              "title" : $util.dynamodb.toDynamoDBJson($context.arguments.title),
+              "content" : $util.dynamodb.toDynamoDBJson($context.arguments.content),
+              "url" : $util.dynamodb.toDynamoDBJson($context.arguments.url),
+            }
+          }
+        ResponseMappingTemplate: |
+          $utils.toJson($context.result)
+      DependsOn:
+        - RegionalApiSchema
+    
+    getPostResolver:
+      Type: AWS::AppSync::Resolver
+      Properties:
+        ApiId: !GetAtt RegionalApi.ApiId
+        DataSourceName: !GetAtt DynamoDataSource.Name
+        TypeName: Query
+        FieldName: getPost
+        RequestMappingTemplate: |
+          {
+            "version" : "2017-02-28",
+            "operation" : "GetItem",
+            "key" : {
+              "id" : $util.dynamodb.toDynamoDBJson($ctx.args.id)
+            }
+          }
+        ResponseMappingTemplate: |
+          $utils.toJson($context.result)
+      DependsOn:
+        - RegionalApiSchema
+    
+#####################
+### API RESOURCES ###
+#####################
+    
+    RestApi:
+      Type: AWS::ApiGateway::RestApi
+      Properties:
+        Name: !Sub "${self:custom.parentService}-${AWS::Region}-Proxy-Api"
+        EndpointConfiguration:
+          Types:
+            - REGIONAL
+        #DisableExecuteApiEndpoint: true
+    
+    Deployment:
+      Type: AWS::ApiGateway::Deployment
+      Properties:
+        RestApiId: !Ref RestApi
+        StageName: !Ref stageName
+      DependsOn:
+        - GraphQLMethod
+        - PingMethod
+    
+    graphqlResource:
+      Type: AWS::ApiGateway::Resource
+      Properties:
+        RestApiId: !Ref RestApi
+        ParentId: !GetAtt RestApi.RootResourceId
+        PathPart: graphql
+    
+    pingResource:
+      Type: AWS::ApiGateway::Resource
+      Properties:
+        RestApiId: !Ref RestApi
+        ParentId: !GetAtt RestApi.RootResourceId
+        PathPart: ping
+    
+    GraphQLMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        OperationName: graphql route
+        ApiKeyRequired: false
+        AuthorizationType: NONE
+        HttpMethod: POST
+        Integration:
+          IntegrationHttpMethod: POST
+          Type: HTTP
+          Uri: !GetAtt RegionalApi.GraphQLUrl
+          PassthroughBehavior: WHEN_NO_MATCH
+          TimeoutInMillis: 29000
+          IntegrationResponses:
+            - StatusCode: '200'
+          RequestParameters:
+            integration.request.header.x-api-key: "method.request.header.x-api-key"
+            integration.request.header.authorization: "method.request.header.authorization"
+        MethodResponses:
+          - StatusCode: 200
+        RestApiId: !Ref RestApi
+        ResourceId: !GetAtt graphqlResource.ResourceId
+        RequestParameters:
+          method.request.header.x-api-key: false
+          method.request.header.authorization: false
+    
+    PingMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        OperationName: ping route
+        ApiKeyRequired: false
+        AuthorizationType: NONE
+        HttpMethod: GET
+        Integration:
+          IntegrationHttpMethod: POST
+          #Type: AWS
+          Type: AWS_PROXY
+          #Credentials: !GetAtt ApiIntegrationRole.Arn
+          Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PingMethodLambdaFunction}/invocations"
+          PassthroughBehavior: WHEN_NO_MATCH
+          TimeoutInMillis: 29000
+          IntegrationResponses:
+            - StatusCode: '200'
+        MethodResponses:
+          - StatusCode: 200
+        RestApiId: !Ref RestApi
+        ResourceId: !GetAtt pingResource.ResourceId
+    
+    #PingMethodFunction:
+    #  Type: AWS::Lambda::Function
+    #  Properties:
+    #    FunctionName: !Sub "${self:custom.parentService}-${AWS::Region}-PingMethodFunction"
+    #    Role: !GetAtt lambdaRole.Arn
+    #    Handler: index.handler
+    #    CodeUri: ./
+    #    LoggingConfig:
+    #      LogFormat: JSON
+    #
+    #PingMethodFunctionLogGroup:
+    #  Type: AWS::Logs::LogGroup
+    #  Properties:
+    #    LogGroupName: !Join ['', ['/aws/lambda/', !Ref PingMethodLambdaFunction]]
+    
+    PingMethodFunctionEBPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt PingMethodLambdaFunction.Arn
+        Action: lambda:InvokeFunction
+        Principal: apigateway.amazonaws.com
+        #SourceArn: !Ref GraphQLApi
+    
+    AppsyncAuthorizerEBPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt AppsyncAuthorizerLambdaFunction.Arn
+        Action: lambda:InvokeFunction
+        Principal: appsync.amazonaws.com
+        #SourceArn: !Ref GraphQLApi
+    
+    RestApiBasePathMapping:
+      Type: AWS::ApiGateway::BasePathMapping
+      Properties:
+        #BasePath: !Ref stageName
+        DomainName: !Ref domainName
+        RestApiId: !Ref RestApi
+        Stage: !Ref stageName
+      DependsOn:
+        - RestApiDomain
+    
+    RestApiDomain:
+      Type: AWS::ApiGateway::DomainName
+      Properties:
+        RegionalCertificateArn: !Ref HttpApiCert
+        DomainName: !Ref domainName
+        EndpointConfiguration: 
+          Types:
+            - REGIONAL
+        SecurityPolicy: TLS_1_2
+    
+    HttpApiCert:
+      Type: AWS::CertificateManager::Certificate
+      Properties:
+        DomainName: !Sub "${AWS::Region}.${domainName}"
+        DomainValidationOptions:
+         - DomainName: !Ref domainName
+           HostedZoneId: !Ref hostedZoneId
+         - DomainName: !Sub "${AWS::Region}.${domainName}"
+           HostedZoneId: !Ref hostedZoneId
+        SubjectAlternativeNames:
+          - !Ref domainName
+          - !Sub "${AWS::Region}.${domainName}"
+        ValidationMethod: DNS
+    
+    # aws cloudwatch put-metric-data --metric-name Failover --namespace HealthCheck --unit Count --value 1 --region eu-west-1
+    regionalHealthCheckAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: APIGatewayHealthCheck
+        AlarmDescription: Alarm that causes DNS failover
+        ActionsEnabled: False
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        DatapointsToAlarm: 1
+        EvaluationPeriods: 1
+        MetricName: Failover
+        Namespace: HealthCheck
+        Period: 60
+        Threshold: 1.0
+        TreatMissingData: ignore
+        Unit: Count
+        Statistic: Sum
+    
+    regionalHealthCheck:
+      Type: AWS::Route53::HealthCheck
+      DependsOn: PingMethodLogGroup
+      Properties:
+        HealthCheckConfig:
+          Type: CLOUDWATCH_METRIC
+          AlarmIdentifier:
+            Name: !Ref regionalHealthCheckAlarm
+            Region: !Ref AWS::Region
+          InsufficientDataHealthStatus: LastKnownStatus
+          #InsufficientDataHealthStatus: Healthy
+    
+    #regionalHealthCheck:
+    #  Type: AWS::Route53::HealthCheck
+    #  DependsOn: PingMethodLogGroup
+    #  Properties:
+    #    HealthCheckConfig:
+    #      Port: 443
+    #      Type: HTTPS
+    #      ResourcePath: !Sub "/${stageName}/ping"
+    #      #ResourcePath: !Sub /84b09a70-9677-47bc-849d-4e5ba2b71238
+    #      FullyQualifiedDomainName: !Sub "${RestApi}.execute-api.${AWS::Region}.amazonaws.com"
+    #      #FullyQualifiedDomainName: webhook.site
+    #      RequestInterval: 30
+    #      FailureThreshold: 1
+    #      MeasureLatency: false
+    #      Inverted: false
+    #      #EnableSNI: true
+    #      EnableSNI: false
+    
+    RestApiDistributionRecord:
+      Type: AWS::Route53::RecordSet
+      Properties:
+        Name: !Ref domainName
+        HostedZoneId: !Ref hostedZoneId
+        Type: A
+        Region: !Ref AWS::Region
+        SetIdentifier: !Ref AWS::Region
+        AliasTarget:
+          DNSName: !GetAtt RestApiDomain.RegionalDomainName
+          EvaluateTargetHealth: true
+          HostedZoneId: !GetAtt RestApiDomain.RegionalHostedZoneId
+        HealthCheckId: !Ref regionalHealthCheck
+    
+    KMSkeyReplica:
+      Type: AWS::KMS::ReplicaKey
+      Condition: createKmsReplica
+      Properties:
+        PrimaryKeyArn: !Ref KMSkeyArn
+        Enabled: true
+        KeyPolicy: # Key policy is required for replicas
+          Version: '2012-10-17'
+          Id: key-default-1
+          Statement:
+            - Sid: Enable IAM User Permissions
+              Effect: Allow
+              Principal:
+                AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+              Action: kms:*
+              Resource: '*'
+        PendingWindowInDays: 7
+              
+    KMSkeyReplicaAlias:
+      Type: AWS::KMS::Alias
+      Condition: createKmsReplica
+      Properties:
+        AliasName: !Ref KMSkeyAlias
+        TargetKeyId: !GetAtt KMSkeyReplica.KeyId
+    

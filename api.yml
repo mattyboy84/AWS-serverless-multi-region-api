@@ -1,0 +1,166 @@
+service: sls-multi-region-api
+
+frameworkVersion: '3'
+
+plugins:
+  - serverless-plugin-for-each
+
+custom:
+  domainName: ${param:domainName}
+  subDomainName: ${param:subDomainName}
+  hostedZoneId: ${param:hostedZoneId}
+  Regions:
+    - eu-west-1
+    - eu-west-2
+    - us-east-1
+    - us-west-1
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  deploymentBucket:
+    name: gitlab-codebucket
+    blockPublicAccess: true
+
+resources:
+  Parameters:
+    domainName:
+      Type: String
+      Description: optional name of domain name to register to the api
+      Default: ${self:custom.domainName}
+    subDomainName:
+      Type: String
+      Description: optional sub domain name - leave empty to omit
+      Default: ${self:custom.subDomainName}
+    hostedZoneId:
+      Type: String
+      Description: Id of the doamin hosted zone. - leave blank to omit
+      Default: ${self:custom.hostedZoneId}
+  
+  Conditions:
+    IsSubDomainConfigured: !Not [!Equals [!Ref subDomainName, '']]
+  
+  Resources:
+    globalTable:
+      Type: AWS::DynamoDB::GlobalTable
+      Properties:
+        TableName: !Sub "${self:service}-globalTable"
+        AttributeDefinitions:
+          - AttributeName: 'id'
+            AttributeType: 'S'
+        KeySchema:
+          - AttributeName: 'id'
+            KeyType: 'HASH'
+        BillingMode: PAY_PER_REQUEST
+        #GlobalSecondaryIndexes:
+        #  - GlobalSecondaryIndex
+        #LocalSecondaryIndexes:
+        #  - LocalSecondaryIndex
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+        Replicas:
+          - $forEach:
+              iterator: ${self:custom.Regions}
+              template:
+                - Region: $forEach.value
+                  TableClass: STANDARD
+                  ContributorInsightsSpecification:
+                    Enabled: true
+                  PointInTimeRecoverySpecification:
+                    PointInTimeRecoveryEnabled: true
+                  #GlobalSecondaryIndexes:
+                  #  - ReplicaGlobalSecondaryIndexSpecification
+                  #ReadProvisionedThroughputSettings:
+                  #  ReadProvisionedThroughputSettings
+        #Replicas:
+        #  - Region: us-east-1
+        #    TableClass: STANDARD
+        #    ContributorInsightsSpecification:
+        #      Enabled: true
+        #    PointInTimeRecoverySpecification:
+        #      PointInTimeRecoveryEnabled: true
+        #    #GlobalSecondaryIndexes:
+        #    #  - ReplicaGlobalSecondaryIndexSpecification
+        #    #ReadProvisionedThroughputSettings:
+        #    #  ReadProvisionedThroughputSettings
+        TimeToLiveSpecification: 
+          Enabled: true
+          AttributeName: ttl
+    
+    KMSkey:
+      Type: AWS::KMS::Key
+      Properties:
+        BypassPolicyLockoutSafetyCheck: false
+        Enabled: true
+        EnableKeyRotation: false # Can only be true for SYMMETRIC_DEFAULT keys
+        KeyPolicy: # This default policy is auto generated if omitted
+          Version: '2012-10-17'
+          Id: key-default-1
+          Statement:
+            - Sid: Enable IAM User Permissions
+              Effect: Allow
+              Principal:
+                AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+              Action: kms:*
+              Resource: '*'
+        # SYMMETRIC_DEFAULT - 256 bit symmetric key for encrytion and decryption
+        KeySpec: SYMMETRIC_DEFAULT # Can also be a HMAC, RSA or ECC key
+        KeyUsage: ENCRYPT_DECRYPT # Can be ENCRYPT_DECRYPT, SIGN_VERIFY or GENERATE_VERIFY_MAC
+        MultiRegion: true
+        Origin: AWS_KMS
+        PendingWindowInDays: 7 # waiting period before KMS deletes the key
+    
+    KMSkeyAlias:
+      Type: AWS::KMS::Alias
+      Properties:
+        AliasName: !Sub "alias/${AWS::StackName}-key"
+        TargetKeyId: !Ref KMSkey
+    
+    globalTableNameParameter:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: !Sub "/${self:service}/globalTableName"
+        Tier: Standard
+        Type: String
+        Value: !Ref globalTable
+    
+    globalTableArnParameter:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: !Sub "/${self:service}/globalTableArn"
+        Tier: Standard
+        Type: String
+        Value: !GetAtt globalTable.Arn
+    
+    hostedZoneIdParameter:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: !Sub "/${self:service}/hostedZoneId"
+        Tier: Standard
+        Type: String
+        Value: !Ref hostedZoneId
+    
+    domainNameParameter:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: !Sub "/${self:service}/domainName"
+        Tier: Standard
+        Type: String
+        Value: !If [IsSubDomainConfigured, !Sub "${subDomainName}.${domainName}", !Ref domainName]
+    
+    KMSkeyArnParameter:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: !Sub "/${self:service}/KMSkeyArn"
+        Tier: Standard
+        Type: String
+        Value: !GetAtt KMSkey.Arn
+    
+    KMSkeyAliasParameter:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: !Sub "/${self:service}/KMSkeyAlias"
+        Tier: Standard
+        Type: String
+        Value: !Ref KMSkeyAlias
+    

@@ -1,0 +1,49 @@
+image: public.ecr.aws/sam/build-nodejs18.x:latest
+
+stages:
+  - deploy:api
+  - deploy:node
+  - remove:node
+  - remove:api
+
+variables:
+  STACK_NAME: global-api
+  STACK_REGION: eu-west-1
+  SUB_DOMAIN: global-api
+  REGIONS: '["us-east-1", "eu-west-1"]'
+  ROUTE_53_DOMAIN: abc.com
+  ROUTE_53_DOMAIN_ID: 0123456789
+
+deploy:api:
+  stage: deploy:api
+  script:
+    - npm ci
+    - npm run deploy:api -- --region $STACK_REGION --param="subDomainName=$SUB_DOMAIN" --param="domainName=$ROUTE_53_DOMAIN" --param="hostedZoneId=$ROUTE_53_DOMAIN_ID"
+
+deploy:node:
+  stage: deploy:node
+  script:
+    - npm ci
+    - |
+      REGION_ARRAY=($(echo "$REGIONS" | jq -r '.[]'))
+      for region in "${REGION_ARRAY[@]}"; do
+        npm run deploy:node -- --region "$region" --param="parentRegion=$STACK_REGION"
+      done
+
+remove:api:
+  stage: remove:api
+  script:
+    - npm ci
+    - npm run remove:api -- --region $STACK_REGION --param="subDomainName=$SUB_DOMAIN" --param="domainName=$ROUTE_53_DOMAIN" --param="hostedZoneId=$ROUTE_53_DOMAIN_ID"
+  when: manual
+
+remove:node:
+  stage: remove:node
+  script:
+    - npm ci
+    - |
+      REGION_ARRAY=($(echo "$REGIONS" | jq -r '.[]'))
+      for region in "${REGION_ARRAY[@]}"; do
+        npm run remove:node -- --region "$region"
+      done
+  when: manual
